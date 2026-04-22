@@ -70,20 +70,36 @@ dsmem_read_kernel(double *__restrict__ sink,
     // Map remote block's shared memory – generates ld.shared::cluster
     double *remote = cluster.map_shared_rank(smem, remote_rank);
 
-    // 4 independent accumulators → 4 loads can be in-flight per thread
-    double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+    // 8 independent accumulators.
+    //
+    // For 64kB SMEM + 1024 threads: 8192 doubles / 1024 = 8 elements per thread.
+    // The 8-wide inner loop handles all 8 in ONE step → all 8 loads are
+    // simultaneously in-flight per thread with NO mid-iteration dependency.
+    //
+    // Previously a 4-wide loop needed 2 steps, creating a RAW chain:
+    //   step1 loads → FP-add → step2 loads (step2 must wait for step1)
+    // With 8-wide + 1 step, all loads are issued before any add completes.
+    //
+    // Cross-iteration dependency (a_k[N+1] depends on a_k[N]) is unavoidable
+    // without register explosion, but the GPU hides it via warp switching.
+    double a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;
 
     for (int it = 0; it < iters; ++it) {
         int i = tid;
-        for (; i + 3 * bdim < smem_n; i += 4 * bdim) {
-            a0 += remote[i            ];
-            a1 += remote[i +     bdim ];
-            a2 += remote[i + 2 * bdim ];
-            a3 += remote[i + 3 * bdim ];
+        // 8-wide unrolled – covers 8 stride-bdim elements simultaneously
+        for (; i + 7 * bdim < smem_n; i += 8 * bdim) {
+            a0 += remote[i            ];  a1 += remote[i +     bdim ];
+            a2 += remote[i + 2 * bdim ];  a3 += remote[i + 3 * bdim ];
+            a4 += remote[i + 4 * bdim ];  a5 += remote[i + 5 * bdim ];
+            a6 += remote[i + 6 * bdim ];  a7 += remote[i + 7 * bdim ];
         }
-        // Scalar tail for any remainder (rare; happens when smem_n % (4*bdim) != 0)
-        for (; i < smem_n; i += bdim)
-            a0 += remote[i];
+        // 4-wide tail for smem sizes not divisible by 8*bdim
+        for (; i + 3 * bdim < smem_n; i += 4 * bdim) {
+            a0 += remote[i            ];  a1 += remote[i +     bdim ];
+            a2 += remote[i + 2 * bdim ];  a3 += remote[i + 3 * bdim ];
+        }
+        // Scalar tail
+        for (; i < smem_n; i += bdim) a0 += remote[i];
     }
 
     // *** Critical: wait for all cluster blocks to finish reading ***
@@ -92,7 +108,7 @@ dsmem_read_kernel(double *__restrict__ sink,
     // via cluster.map_shared_rank → unspecified launch failure.
     cluster.sync();
 
-    if (sf) sink[blockIdx.x * bdim + tid] = a0 + a1 + a2 + a3;
+    if (sf) sink[blockIdx.x * bdim + tid] = a0+a1+a2+a3+a4+a5+a6+a7;
 }
 
 // Write bandwidth kernel.
