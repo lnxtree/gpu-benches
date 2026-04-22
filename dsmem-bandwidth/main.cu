@@ -86,6 +86,12 @@ dsmem_read_kernel(double *__restrict__ sink,
             a0 += remote[i];
     }
 
+    // *** Critical: wait for all cluster blocks to finish reading ***
+    // Without this, a block that finishes iters slightly earlier can exit and
+    // have its SMEM reclaimed by the SM while a peer block is still reading it
+    // via cluster.map_shared_rank → unspecified launch failure.
+    cluster.sync();
+
     if (sf) sink[blockIdx.x * bdim + tid] = a0 + a1 + a2 + a3;
 }
 
@@ -119,10 +125,16 @@ dsmem_write_kernel(double *__restrict__ sink,
     double *remote = cluster.map_shared_rank(smem, remote_rank);
 
     // Pure streaming write – each store is independent → max write throughput
+    // Use (double)it to avoid int overflow in it * smem_n at large iters.
     for (int it = 0; it < iters; ++it) {
+        double base = (double)it;
         for (int i = tid; i < smem_n; i += bdim)
-            remote[i] = (double)(it * smem_n + i) * 0.001;
+            remote[i] = base + (double)i * 0.001;
     }
+
+    // *** Critical: same rationale as read kernel – must sync before any block
+    // exits so that peer blocks still writing to our SMEM see it as live. ***
+    cluster.sync();
 
     // Touch own SMEM (written by neighbor) to create a visible side effect
     if (sf) sink[blockIdx.x * bdim + tid] = smem[tid % smem_n];
@@ -133,6 +145,10 @@ dsmem_write_kernel(double *__restrict__ sink,
 template <typename LaunchFn>
 double measure_bw(LaunchFn launch, long long bytes_per_launch)
 {
+    // Clear any stale error state from a previous (failed) launch before we
+    // check the result of this one.
+    cudaGetLastError();
+
     // Warmup
     launch();
     GPU_ERROR(cudaDeviceSynchronize());
